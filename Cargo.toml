@@ -1,0 +1,18 @@
+[package]
+name = "sokobanonline"
+version = "0.1.0"
+edition = "2024"
+description = "Fetch one author's levels from sokobanonline.com into an XSB level collection (.txt)"
+
+[dependencies]
+anstream = "1"
+anstyle = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+console = "0.16"
+ctrlc = "3"
+indicatif = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+soukoban = { git = "https://github.com/ShenMian/soukoban" }
