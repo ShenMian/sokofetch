@@ -1,9 +1,9 @@
 # sokofetch
 
-!!! warning Compliance
-    The site's `robots.txt` disallows `/api/`: the API is not meant to be crawled, so keep
-    fetches one-off, low-volume, and personal-use. Do not redistribute the fetched levels;
-    the copyright belongs to their authors.
+> [!WARNING]  
+> The site's `robots.txt` disallows `/api/`: the API is not meant to be crawled,
+> so keep fetches one-off, low-volume, and personal-use. Do not redistribute the fetched levels;
+> the copyright belongs to their authors.
 
 A toolchain for fetching levels of an author (community pack) from [Sokoban Online]
 and exporting them as an [XSB] level collection.
