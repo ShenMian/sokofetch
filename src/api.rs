@@ -1,5 +1,6 @@
 //! Minimal client for the public sokobanonline.com REST API (see docs/API.md).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -46,6 +47,11 @@ pub struct Pack {
     #[serde(rename = "fullslug")]
     pub full_slug: String,
     pub path: String,
+    /// The site's own level counter for this pack. For a container it counts
+    /// its sub-packs' levels *and* its own, which is how levels that belong to
+    /// no sub-pack can be detected (docs/API.md §3.2.1).
+    #[serde(default, rename = "numpuzzles")]
+    pub num_puzzles: Option<u64>,
 }
 
 /// Author info embedded in a puzzle detail.
@@ -61,6 +67,18 @@ pub struct PuzzleItem {
     #[serde(rename = "puzzleid")]
     pub puzzle_id: i64,
     pub name: String,
+}
+
+impl PuzzleItem {
+    /// `name (id)`, or just the id for entries recovered from the sitemap,
+    /// which carry no name.
+    pub fn label(&self) -> String {
+        if self.name.is_empty() {
+            self.puzzle_id.to_string()
+        } else {
+            format!("{} ({})", self.name, self.puzzle_id)
+        }
+    }
 }
 
 /// One sub-pack entry of a container listing.
@@ -79,6 +97,21 @@ pub struct PackRef {
 pub struct Listing {
     pub puzzles: Vec<PuzzleItem>,
     pub packs: Vec<PackRef>,
+}
+
+/// A whole collection: the pack, every level reachable through it, and the
+/// bookkeeping needed to tell whether some levels were left out.
+#[derive(Debug)]
+pub struct Collection {
+    pub pack: Pack,
+    pub items: Vec<PuzzleItem>,
+    /// Number of sub-packs (`0` for a flat author page).
+    pub groups: usize,
+    /// Levels counted inside those sub-packs.
+    pub grouped: u64,
+    /// Levels the site counts for the pack but that no sub-pack holds — they
+    /// sit directly on the collection page and are never linked from it.
+    pub hidden: u64,
 }
 
 /// Listing entries come in two shapes: puzzles (`puzzle_id`) and sub-packs
@@ -244,13 +277,13 @@ impl Client {
         Ok(())
     }
 
-    fn get_json<D: DeserializeOwned>(&self, path: &str) -> anyhow::Result<Envelope<D>> {
-        let url = format!("{}{path}", self.base);
+    /// GET one URL (absolute) with retries, returning the raw body.
+    fn get_text(&self, url: &str) -> anyhow::Result<String> {
         for attempt in 1..=MAX_ATTEMPTS {
             if self.stopped() {
                 bail!("interrupted by user");
             }
-            match self.agent.get(&url).call() {
+            match self.agent.get(url).call() {
                 Ok(response) => {
                     // http_status_as_error is disabled: 4xx/5xx arrive as Ok.
                     let code = response.status().as_u16();
@@ -270,7 +303,7 @@ impl Client {
                         continue;
                     }
                     if code == 404 {
-                        return Err(NotFound(url).into());
+                        return Err(NotFound(url.to_owned()).into());
                     }
                     if !(200..300).contains(&code) {
                         bail!(
@@ -278,15 +311,12 @@ impl Client {
                             error_excerpt(response.into_body())
                         );
                     }
-                    let envelope: Envelope<D> = response
+                    let body = response
                         .into_body()
-                        .read_json()
-                        .with_context(|| format!("decoding response of {url}"))?;
+                        .read_to_string()
+                        .with_context(|| format!("reading response of {url}"))?;
                     self.sleep(self.delay)?;
-                    if envelope.status != "success" {
-                        bail!("API reported status {:?} for {url}", envelope.status);
-                    }
-                    return Ok(envelope);
+                    return Ok(body);
                 }
                 Err(err) => {
                     if attempt < MAX_ATTEMPTS {
@@ -301,13 +331,20 @@ impl Client {
         bail!("giving up on {url} after {MAX_ATTEMPTS} attempts")
     }
 
+    fn get_json<D: DeserializeOwned>(&self, path: &str) -> anyhow::Result<Envelope<D>> {
+        let url = format!("{}{path}", self.base);
+        let body = self.get_text(&url)?;
+        let envelope: Envelope<D> =
+            serde_json::from_str(&body).with_context(|| format!("decoding response of {url}"))?;
+        if envelope.status != "success" {
+            bail!("API reported status {:?} for {url}", envelope.status);
+        }
+        Ok(envelope)
+    }
+
     /// Fetch every puzzle of one author: either the author page lists puzzles
     /// directly, or it is a container whose sub-packs are fetched in turn.
-    pub fn fetch_pack(
-        &self,
-        username: &str,
-        progress: &ProgressBar,
-    ) -> anyhow::Result<(Pack, Vec<PuzzleItem>)> {
+    pub fn fetch_pack(&self, username: &str, progress: &ProgressBar) -> anyhow::Result<Collection> {
         match self.fetch_author(username, progress) {
             Err(err) if err.downcast_ref::<NotFound>().is_some() => bail!(
                 "author/pack not found: {username} (https://www.sokobanonline.com/play/community/{username})"
@@ -332,18 +369,14 @@ impl Client {
         }
     }
 
-    fn fetch_author(
-        &self,
-        username: &str,
-        progress: &ProgressBar,
-    ) -> anyhow::Result<(Pack, Vec<PuzzleItem>)> {
+    fn fetch_author(&self, username: &str, progress: &ProgressBar) -> anyhow::Result<Collection> {
         let (pack, listing) =
             self.fetch_listing(&format!("community/{username}"), username, progress)?;
-        if listing.packs.is_empty() {
-            return Ok((pack, listing.puzzles));
-        }
+        let groups = listing.packs.len();
+        let mut items = listing.puzzles;
+        let direct = items.len() as u64;
         // Container page: collect the puzzles of every sub-pack (one level deep).
-        let mut puzzles = listing.puzzles;
+        let mut grouped = 0u64;
         for sub in &listing.packs {
             let label = format!("{} ({})", display_path(&sub.full_slug), sub.name);
             let (_, sub_listing) = self.fetch_listing(&sub.full_slug, &label, progress)?;
@@ -353,9 +386,72 @@ impl Client {
                     sub.full_slug
                 );
             }
-            puzzles.extend(sub_listing.puzzles);
+            grouped += sub_listing.puzzles.len() as u64;
+            items.extend(sub_listing.puzzles);
         }
-        Ok((pack, puzzles))
+        // The pack's own counter covers sub-packs *and* the levels that sit on
+        // the container itself; the listing only ever returns one of the two.
+        // A page without sub-packs returns its own levels, so nothing is hidden.
+        let hidden = if groups == 0 {
+            0
+        } else {
+            pack.num_puzzles
+                .map_or(0, |total| total.saturating_sub(grouped + direct))
+        };
+        Ok(Collection {
+            pack,
+            items,
+            groups,
+            grouped,
+            hidden,
+        })
+    }
+
+    /// Levels that sit directly on a collection page instead of inside one of
+    /// its sub-packs. The pack listing never returns them, so they are read
+    /// from the site's sitemap instead — the one enumeration path `robots.txt`
+    /// advertises (docs/API.md §3.2.1, §3.5).
+    pub fn fetch_ungrouped(
+        &self,
+        collection: &str,
+        progress: &ProgressBar,
+    ) -> anyhow::Result<Vec<PuzzleItem>> {
+        let prefix = format!("play/community/{collection}/");
+        let index = self.get_text(&format!("{}/sitemap.xml", self.origin()))?;
+        let shards: Vec<&str> = xml_locs(&index)
+            .filter_map(|loc| loc.rsplit_once("/sitemaps/").map(|(_, name)| name))
+            .filter(|name| name.starts_with("puzzles-"))
+            .collect();
+        if shards.is_empty() {
+            bail!("no puzzle sitemaps listed in /sitemap.xml");
+        }
+        let mut ids = BTreeSet::new();
+        for (index, shard) in shards.iter().enumerate() {
+            progress.set_message(format!(
+                "scanning sitemap {}/{} for ungrouped levels ...",
+                index + 1,
+                shards.len()
+            ));
+            let xml = self.get_text(&format!("{}/sitemaps/{shard}", self.origin()))?;
+            ids.extend(
+                xml_locs(&xml)
+                    .filter_map(site_path)
+                    .filter_map(|path| path.strip_prefix(&prefix))
+                    .filter_map(direct_puzzle_id),
+            );
+        }
+        Ok(ids
+            .into_iter()
+            .map(|puzzle_id| PuzzleItem {
+                puzzle_id,
+                name: String::new(),
+            })
+            .collect())
+    }
+
+    /// The site root, i.e. the API base without its `/api/v1` suffix.
+    fn origin(&self) -> &str {
+        self.base.strip_suffix("/api/v1").unwrap_or(&self.base)
     }
 
     /// Paginate `/packs/by-path/{fullslug}`; entries may be puzzles or sub-packs.
@@ -408,6 +504,28 @@ fn path_to_fullslug(path: &str) -> String {
         .unwrap_or(path)
         .trim_matches('/')
         .to_owned()
+}
+
+/// Every `<loc>` value of a sitemap document.
+fn xml_locs(xml: &str) -> impl Iterator<Item = &str> {
+    xml.split("<loc>")
+        .skip(1)
+        .filter_map(|chunk| chunk.split("</loc>").next())
+}
+
+/// `https://host/play/community/x/1_y` -> `play/community/x/1_y`, so sitemap
+/// entries can be matched without caring about the host they were listed under.
+fn site_path(loc: &str) -> Option<&str> {
+    loc.find("/play/").map(|at| &loc[at + 1..])
+}
+
+/// `136063_46-steps` -> `136063`; `None` when the remainder is a deeper path
+/// (`remakes/135959_miniature-tower`), i.e. a level inside a sub-pack.
+fn direct_puzzle_id(rest: &str) -> Option<i64> {
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    rest.split_once('_')?.0.parse().ok()
 }
 
 /// Pull a human-readable message out of an API error envelope, falling back to raw text.
@@ -723,9 +841,9 @@ mod tests {
                 wire_listing(Some(wire_pack("t1024")), items, 3),
             ))
         });
-        let (pack, puzzles) = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
-        assert_eq!(pack.name, "t1024");
-        let ids: Vec<i64> = puzzles.into_iter().map(|p| p.puzzle_id).collect();
+        let collection = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
+        assert_eq!(collection.pack.name, "t1024");
+        let ids: Vec<i64> = collection.items.into_iter().map(|p| p.puzzle_id).collect();
         assert_eq!(ids, [11, 12, 13]);
         let calls = server.calls();
         assert!(calls[0].ends_with("page=1"), "{calls:?}");
@@ -790,8 +908,8 @@ mod tests {
             };
             Action::Respond(Response::json(200, data))
         });
-        let (_pack, puzzles) = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
-        let ids: Vec<i64> = puzzles.into_iter().map(|p| p.puzzle_id).collect();
+        let collection = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
+        let ids: Vec<i64> = collection.items.into_iter().map(|p| p.puzzle_id).collect();
         assert_eq!(ids, [11, 21, 22]);
         assert!(
             server.calls()[1].starts_with("/packs/by-path/community/t1024/corner-set"),
@@ -849,5 +967,94 @@ mod tests {
         assert_eq!(listing.packs.len(), 1);
         assert_eq!(listing.packs[0].full_slug, "community/t1024/corner-set");
         assert_eq!(listing.packs[0].num_puzzles, Some(3));
+    }
+
+    // ---- levels that belong to no sub-pack (docs/API.md §3.2.1) ----
+
+    const SITEMAP_INDEX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<sitemap><loc>https://www.sokobanonline.com/sitemaps/pages.xml</loc></sitemap>
+<sitemap><loc>https://www.sokobanonline.com/sitemaps/packs.xml</loc></sitemap>
+<sitemap><loc>https://www.sokobanonline.com/sitemaps/puzzles-1.xml</loc></sitemap>
+</sitemapindex>"#;
+
+    /// One direct level, one inside a sub-pack, one belonging to another
+    /// author — only the first may be returned.
+    const SITEMAP_SHARD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://www.sokobanonline.com/play/community/obyzz011/136074_39-steps</loc></url>
+<url><loc>https://www.sokobanonline.com/play/community/obyzz011/remakes/135959_miniature-tower</loc></url>
+<url><loc>https://www.sokobanonline.com/play/community/obyzz011/136063_46-steps</loc></url>
+<url><loc>https://www.sokobanonline.com/play/community/someoneelse/136001_other</loc></url>
+</urlset>"#;
+
+    #[test]
+    fn ungrouped_levels_come_from_the_puzzle_sitemaps() {
+        let (server, client) = server_with(|_call, target| match target {
+            "/sitemap.xml" => Action::Respond(Response::plain(200, SITEMAP_INDEX)),
+            "/sitemaps/puzzles-1.xml" => Action::Respond(Response::plain(200, SITEMAP_SHARD)),
+            _ => Action::Respond(Response::plain(500, "unexpected target")),
+        });
+        let items = client
+            .fetch_ungrouped("obyzz011", &ProgressBar::hidden())
+            .unwrap();
+        let ids: Vec<i64> = items.iter().map(|item| item.puzzle_id).collect();
+        assert_eq!(ids, [136063, 136074], "direct levels only, sorted");
+        assert!(items.iter().all(|item| item.name.is_empty()));
+        assert_eq!(server.calls(), ["/sitemap.xml", "/sitemaps/puzzles-1.xml"]);
+    }
+
+    #[test]
+    fn a_sitemap_without_puzzle_shards_is_an_error() {
+        let (_server, client) = server_with(|_call, _target| {
+            Action::Respond(Response::plain(
+                200,
+                r#"<sitemapindex><sitemap><loc>https://x/sitemaps/packs.xml</loc></sitemap></sitemapindex>"#,
+            ))
+        });
+        let err = client
+            .fetch_ungrouped("obyzz011", &ProgressBar::hidden())
+            .unwrap_err();
+        assert!(err.to_string().contains("no puzzle sitemaps"), "{err:#}");
+    }
+
+    #[test]
+    fn hidden_levels_are_the_pack_total_minus_the_sub_packs() {
+        let (_server, client) = server_with(|call, _target| {
+            let data = if call == 0 {
+                wire_listing(
+                    Some(wire_pack("t1024")),
+                    vec![wire_pack_item("community/t1024/corner-set")],
+                    1,
+                )
+            } else {
+                wire_listing(
+                    Some(wire_pack("corner-set")),
+                    vec![wire_puzzle_item(21), wire_puzzle_item(22)],
+                    2,
+                )
+            };
+            Action::Respond(Response::json(200, data))
+        });
+        let collection = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
+        assert_eq!(collection.groups, 1);
+        assert_eq!(collection.grouped, 2);
+        assert_eq!(
+            collection.hidden, 5,
+            "the site counts 7 for the pack, its sub-packs hold 2"
+        );
+    }
+
+    #[test]
+    fn a_page_without_sub_packs_hides_nothing() {
+        let (_server, client) = server_with(|_call, _target| {
+            Action::Respond(Response::json(
+                200,
+                wire_listing(Some(wire_pack("t1024")), vec![wire_puzzle_item(11)], 1),
+            ))
+        });
+        let collection = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
+        assert_eq!(collection.groups, 0);
+        assert_eq!(collection.hidden, 0);
     }
 }

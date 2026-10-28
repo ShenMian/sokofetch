@@ -194,6 +194,14 @@ pub fn wire_puzzle_item(id: i64) -> serde_json::Value {
     serde_json::json!({ "puzzleid": id, "name": format!("p{id}"), "position": 1 })
 }
 
+/// A pack object whose `numpuzzles` counter is set explicitly (the counter
+/// includes levels that belong to no sub-pack).
+pub fn wire_pack_counted(name: &str, num_puzzles: u64) -> serde_json::Value {
+    let mut pack = wire_pack(name);
+    pack["numpuzzles"] = serde_json::json!(num_puzzles);
+    pack
+}
+
 /// One sub-pack entry of a listing.
 pub fn wire_pack_item(fullslug: &str) -> serde_json::Value {
     let name = fullslug.rsplit('/').next().unwrap_or(fullslug);

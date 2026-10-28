@@ -1,7 +1,7 @@
 # Sokoban Online API Format Documentation & Data Profile
 
-> Reverse-engineered + empirically measured data profile. Data source: `https://www.sokobanonline.com`
-> Profile sample: all 459 levels by author `soko7734` (scraped on 2026-10-23, 0 failures).
+> Reverse-engineered + empirically measured data profile. Data source: `https://www.sokobanonline.com`  
+> Profile sample: all 459 levels by author `soko7734` (scraped on 2026-10-23, 0 failures).  
 > ⚠️ The site's robots.txt declares `Disallow: /api/` (Crawl-delay: 5) — low-frequency, personal use only.
 
 ## 1. Overview
@@ -14,7 +14,7 @@
 | Content type   | `application/json`                                                                                           |
 | Server         | Health check exposes database + redis; version `0.1.0`                                                       |
 
-Discovery method: the main JS bundle (`/assets/index-B4hV3n8a.js`) contains only relative paths (e.g. `` `/puzzles/${e}` ``);
+Discovery method: the main JS bundle (`/assets/index-B4hV3n8a.js`) contains only relative paths (e.g. `` `/puzzles/${e}` ``);  
 the base prefix was confirmed via the browser Network panel (`performance.getEntriesByType('resource')`).
 
 ## 2. Common Envelope (Identical Across All Endpoints)
@@ -44,8 +44,8 @@ Error model as observed:
 | 429  | Rate limit triggered (response carries `Retry-After`)   | —           |
 | 401  | Accessing `/me/*` without login                         | —           |
 
-Pagination: list endpoints use `?page=N`; `perpage` is fixed server-side (passing `perpage=100` was observed to be ignored — still 30).
-Out-of-range pages (`page=999`) return 200 with `items: []`; `meta` echoes the requested page number as-is.
+Pagination: list endpoints use `?page=N`; `perpage` is fixed server-side (passing `perpage=100` was observed to be ignored — still 30).  
+Out-of-range pages (`page=999`) return 200 with `items: []`; `meta` echoes the requested page number as-is.  
 Some other endpoints (leaderboards etc.) use cursor pagination instead (`?cursor=…&limit=…`; see the `$i()` helper in the frontend source).
 
 ## 3. Endpoints
@@ -65,13 +65,14 @@ Fetch a pack's level list by its path (an author page is itself a pack: `communi
 
 - `fullslug` = `community/soko7734`
 - `meta.total` in the response is the pack's total level count; `data.items` holds 30 entries per page
-- `data.kind`: observed as `"puzzles"` (items are level summaries containing `puzzleid`);
-  **`"packs"` means a membercontainer-type author page** (items are child-pack summaries containing
-  `packid`/`name`/`fullslug`/`path`/`numpuzzles`; observed for `t1024`: 8 child packs with 57 levels in total).
-  Note that the parent pack's `numpuzzles` is the site's own counter and may exceed the sum of its child packs'
-  level counts (t1024: parent 88 vs. 57 total across child packs); a child pack's own `numpuzzles`
-  matches its `meta.total`.
-  The Rust CLI automatically scrapes each child pack of a `"packs"` page (one level of nesting).
+- `data.kind` is decided **by whether the pack owns child packs**, not by its `packtype`:  
+  `"packs"` (items are child-pack summaries with `packid`/`name`/`fullslug`/`path`/`numpuzzles`)  
+  when `numpacks > 0`, otherwise `"puzzles"` (items are level summaries with `puzzleid`).  
+  A `membercontainer` author with **no** child packs therefore returns `"puzzles"`  
+  (observed for `soko7734`: `packtype=membercontainer`, `numpacks=0`, `kind=puzzles`).  
+  The Rust CLI scrapes each child pack of a `"packs"` page (one level of nesting).
+- ⚠️ A pack can own **both** child packs and its own puzzles, but `kind="packs"` lists only the  
+  child packs. See §3.2.1 — this makes such puzzles unreachable from the UI and invisible to the CLI.
 
 `data.pack` fields:
 
@@ -93,7 +94,7 @@ Fetch a pack's level list by its path (an author page is itself a pack: `communi
 | `creditsname/creditsurl` | string? | null                                                                       |
 | `listed`                 | bool    | true                                                                       |
 | `owner`                  | object  | `{slug:"soko7734"}`                                                        |
-| `ancestors`              | array   | Chain of parent packs (Community → …)                                     |
+| `ancestors`              | array   | Chain of parent packs (Community → …)                                      |
 
 `data.items[]` (metadata per level, **board not included**):
 
@@ -114,9 +115,45 @@ Fetch a pack's level list by its path (an author page is itself a pack: `communi
 | `isjustforfun`   | bool   | false (excluded from rankings)                                                    |
 | `awardsplacings` | bool   | true                                                                              |
 | `bests`          | int[3] | Three integers (gold/silver/bronze tiers, presumably move-count thresholds)       |
-| `publisheddate`  | string | ISO 8601 UTC, 2023-08-18 → 2026-10-20, no nulls                                  |
+| `publisheddate`  | string | ISO 8601 UTC, 2023-08-18 → 2026-10-20, no nulls                                   |
 | `position`       | int    | Position within pack 1..N, no duplicates                                          |
 | `guestlocked`    | bool   | false (no guest locks in this pack)                                               |
+
+### 3.2.1 Container packs that own puzzles directly ⚠️ Verified 2026-10-28
+
+A puzzle always belongs to exactly one pack, but that pack does not have to be a leaf group —  
+it can be the author's root `membercontainer` pack. Such a container holds **two kinds of  
+children at once**: its sub-packs *and* its own puzzles, and the API only ever exposes one of them  
+per response (`kind="packs"` → sub-packs only).
+
+Consequences:
+
+- The author page silently hides those puzzles: `/play/community/obyzz011` reports  
+  `Puzzles: 503 in 16 groups`, yet the 16 child packs add up to 499. The remaining **4** puzzles sit  
+  directly in pack `2110` (`packtotal=4`, `position` 1–4) and appear nowhere on the page.
+- They are still `listed=true` and still show up in the global feeds (`/play/new?type=classic`),  
+  because those feeds are pack-independent. They are reachable only by direct URL  
+  (e.g. `/play/community/obyzz011/136063_46-steps`) or by `prev`/`next` from a sibling.
+- Guests have no UI path to them at all. Logged-in users can get a flat puzzle list for a pack from  
+  `GET /api/v1/me/packs/{packid}/puzzles?filter={unsolved|all-solved|gold|silver|bronze|no-trophy-solved}`  
+  (401 without a session; this is what the "Filter puzzles" chips call when `kind="packs"`).
+- A `"packs"` page's `numpuzzles` therefore counts `sum(child packs) + own puzzles`. This explains the  
+  parent/child count mismatch noted earlier for `t1024` (2026-10-28: parent 103, 9 child packs summing 99).
+
+Observed instances (2026-10-28):
+
+| Author   | Container pack | `numpuzzles` | Child packs | Sum | Orphans                          |
+| -------- | -------------- | ------------ | ----------- | --- | -------------------------------- |
+| obyzz011 | 2110           | 503          | 16          | 499 | 4                                |
+| t1024    | 2187           | 103          | 9           | 99  | 4                                |
+| aymdup   | —              | 94           | 4           | 94  | 0                                |
+| soko7734 | 1846           | 461          | 0           | —   | 0 (no sub-packs, `kind=puzzles`) |
+
+
+**Impact on this CLI**: scraping a `"packs"` author page misses exactly these orphans — they are not in  
+any child pack and the pack endpoints cannot return them. They *can* be enumerated from the site's  
+sitemap (§3.5), which is what `--ungrouped` does; the pack counter makes the miss detectable  
+(`Collection::hidden` in `src/api.rs`).
 
 ### 3.3 `GET /api/v1/puzzles/{puzzleid}` ✅ Verified
 
@@ -151,9 +188,36 @@ POST /api/v1/puzzles/{id}/attempts           Requires login (start attempt, issu
 POST /api/v1/puzzles/{id}/solves             Requires login (submit solution + anti-cheat telemetry)
 ```
 
+### 3.5 Sitemaps ✅ Verified 2026-10-28
+
+`robots.txt` disallows `/api/` but advertises `Sitemap: https://www.sokobanonline.com/sitemap.xml`,  
+so the sitemaps — not the API — are the crawl path the site itself sanctions.
+
+| URL                             | Contents                                                                      |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `/sitemap.xml`                  | `<sitemapindex>`: `pages.xml`, `packs.xml`, `puzzles-1.xml` … `puzzles-3.xml` |
+| `/sitemaps/puzzles-{1,2,3}.xml` | 45 000 / 45 000 / 41 424 `<loc>` entries — 131 424 total, ~16 MB combined     |
+| `/sitemaps/packs.xml`           | Pack pages (not needed here)                                                  |
+
+Puzzle URLs come in three shapes:
+
+```
+/play/community/{author}/{id}_{slug}              <- directly on the author page (no sub-pack)
+/play/community/{author}/{pack}/{id}_{slug}       <- inside a sub-pack
+/play/web-archive/{author}/{pack}/{id}_{slug}     <- imported web archives
+```
+
+The number of segments after the author slug is what identifies an ungrouped level: exactly one means  
+the level hangs off the author's root container pack, i.e. it is one of the levels §3.2.1 describes.  
+Matching `<loc>` against `play/{collection}/` and keeping single-segment remainders reproduces the  
+hidden set exactly (2026-10-28: obyzz011 4 of 4, t1024 4 of 4 — both equal to  
+`numpuzzles − Σ sub-packs`).
+
+Cost: one request for the index plus one per shard; `sokofetch --ungrouped` pays it once per run.
+
 ## 4. `design` Board Encoding Specification
 
-The encoding logic was aligned line-by-line with the parse/serialize functions of the site's bundled
+The encoding logic was aligned line-by-line with the parse/serialize functions of the site's bundled  
 level editor (`/assets/builder-Ch-_DB4f.js`):
 
 ```js
@@ -165,7 +229,7 @@ obj  = row.slice(i*4+2, i*4+4);    // object layer; "__" = none
 
 ### 4.1 classic type (1 char per cell)
 
-Standard Sokoban text format, i.e. the XSB alphabet: `#` wall, `_`/space floor, `$` box, `.` goal,
+Standard Sokoban text format, i.e. the XSB alphabet: `#` wall, `_`/space floor, `$` box, `.` goal,  
 `@` player, `*` box on goal, `+` player on goal. Line width = `width`.
 
 ### 4.2 modern type (4 chars per cell = 2 terrain chars + 2 object chars)
@@ -210,19 +274,19 @@ box $*           → '$'        everything else → ' ' (floor)
 suit goal .X     → '.'
 ```
 
-Suit boxes/goals degrade to ordinary boxes/goals (**losing the "must match suit" constraint**);
-the wildcard box `$X` is semantically an ordinary box, so no loss there.
-Levels containing mechanisms such as rails, ice, holes, doors, magnets, or portals cannot be
-expressed in XSB — any occurrence excludes the entire level (in this pack, 31 levels containing
-the `p^` magnetic switch were excluded; some levels additionally combine ice/rails/doors and were
+Suit boxes/goals degrade to ordinary boxes/goals (**losing the "must match suit" constraint**);  
+the wildcard box `$X` is semantically an ordinary box, so no loss there.  
+Levels containing mechanisms such as rails, ice, holes, doors, magnets, or portals cannot be  
+expressed in XSB — any occurrence excludes the entire level (in this pack, 31 levels containing  
+the `p^` magnetic switch were excluded; some levels additionally combine ice/rails/doors and were  
 excluded in the same pass).
 
-> ⚠️ **Correction from real-world testing (2026-10-23)**: mapping all tile-layer mechanisms
-> (rails/ice/holes/doors/portals/magnets) to plain floor per the table above **silently changes
-> how a level plays** — e.g. zigzag06's only mechanism is ice `~~`, and after degradation it
-> becomes an ordinary level without ice, which no longer matches the original; moreover, such
-> levels cannot be detected from obj-layer tokens alone (buttons `b*`, magnetic switch `p^`).
-> Therefore modern levels **should not be lossily degraded**; the entire level should be excluded
+> ⚠️ **Correction from real-world testing (2026-10-23)**: mapping all tile-layer mechanisms  
+> (rails/ice/holes/doors/portals/magnets) to plain floor per the table above **silently changes  
+> how a level plays** — e.g. zigzag06's only mechanism is ice `~~`, and after degradation it  
+> becomes an ordinary level without ice, which no longer matches the original; moreover, such  
+> levels cannot be detected from obj-layer tokens alone (buttons `b*`, magnetic switch `p^`).  
+> Therefore modern levels **should not be lossily degraded**; the entire level should be excluded  
 > instead (the Rust CLI in this repo does not degrade; it skips all modern levels).
 
 ## 5. Data Profile (author soko7734, measured across 459 levels)
@@ -231,35 +295,43 @@ excluded in the same pass).
 - **Sizes**: 8×6 to 43×42 (area 64–1806 cells), median 15×15
 - **Difficulty & popularity**: numsolve 2–74; numlike -3…8 (can be negative)
 - **Publication dates**: 2023-08-18 → 2026-10-20, spanning 3 years, no nulls
-- **Naming**: serial naming (catchy01…, zigzag17…), with duplicates across pages (e.g. class01–class15
+- **Naming**: serial naming (catchy01…, zigzag17…), with duplicates across pages (e.g. class01–class15  
   and a later republished series)
-- **Mechanism preferences** (total token counts in modern levels): rails 11k+, ice 3528, holes 1763,
-  breakable floors 1275, doors/buttons 1800+, portals 710, magnets 472 + magnetic switches 31 —
+- **Mechanism preferences** (total token counts in modern levels): rails 11k+, ice 3528, holes 1763,  
+  breakable floors 1275, doors/buttons 1800+, portals 710, magnets 472 + magnetic switches 31 —  
   this author favors mechanism-driven gameplay
-- **Box/goal pairing**: suit boxes and suit goals match 1:1 exactly; the `$X` wildcard boxes (5036)
+- **Box/goal pairing**: suit boxes and suit goals match 1:1 exactly; the `$X` wildcard boxes (5036)  
   are extra decoy boxes, so 227 levels have more boxes than goals ("fill goals with surplus boxes" gameplay)
-- **Consistency checks**: puzzleid globally unique; position 1..459 with no duplicates; all modern
+- **Consistency checks**: puzzleid globally unique; position 1..459 with no duplicates; all modern  
   line lengths = 4×width; all classic line lengths = width; no guestlocked levels
-- **XSB-convertible**: two-stage filter — ① representable (no rails/ice/holes/doors/magnets etc.) →
-  428/459 (67 native classic + 361 degraded modern); ② then validated against the XSB loader's hard
-  constraints (exactly 1 player, box count == goal count) → **206 levels** ultimately entered
-  `traditional_levels.txt`.
-  Among the excluded modern levels: 31 contain magnetic switches, 45 are two-player co-op (`@1`+`@2`),
+- **XSB-convertible**: two-stage filter — ① representable (no rails/ice/holes/doors/magnets etc.) →  
+  428/459 (67 native classic + 361 degraded modern); ② then validated against the XSB loader's hard  
+  constraints (exactly 1 player, box count == goal count) → **206 levels** ultimately entered  
+  `traditional_levels.txt`.  
+  Among the excluded modern levels: 31 contain magnetic switches, 45 are two-player co-op (`@1`+`@2`),  
   and 177 have more boxes than goals (`$X` decoy boxes, see above).
-  > ⚠️ The 428/206 figures above are under the lossy-degradation-allowed criterion (tile-layer
-  > mechanisms silently degraded; see the §4.3 correction). Historically the Rust CLI did degrade
-  > modern levels; after strictly excluding mechanisms it produced 98/459 (343 with mechanisms +
-  > 17 decoy-box + 1 two-player). The current criterion **keeps only classic**: **67/459**
+  > ⚠️ The 428/206 figures above are under the lossy-degradation-allowed criterion (tile-layer  
+  > mechanisms silently degraded; see the §4.3 correction). Historically the Rust CLI did degrade  
+  > modern levels; after strictly excluding mechanisms it produced 98/459 (343 with mechanisms +  
+  > 17 decoy-box + 1 two-player). The current criterion **keeps only classic**: **67/459**  
   > (all classic levels pass soukoban validation, 0 rejections); all 392 modern levels are skipped.
 
 ## 6. Tools
 
-Rust CLI (`cargo run -- <slug>`): a single command does the scraping + filtering and directly outputs
-XSB-format `<slug>.txt` (progress bar + resumable after Ctrl-C interruption); each level = map +
-trailing `Title:`/`Author:`/`URL:` metadata lines; supports membercontainer child packs;
+Rust CLI (`cargo run -- fetch <slug>`): a single command does the scraping + filtering and directly  
+outputs XSB-format `<slug>.txt` (progress bar + resumable after Ctrl-C interruption); each level =  
+map + trailing `Title:`/`Author:`/`URL:` metadata lines; supports membercontainer child packs;  
 **keeps only classic levels, skips all modern ones**.
+
+`cargo run -- info <slug>` prints the same structure without fetching levels: the sub-packs with  
+their counts, plus how many levels belong to none of them (§3.2.1). `--ungrouped` extends either  
+subcommand to those levels, recovering their ids from the sitemap (§3.5); `fetch --only-ungrouped`
+fetches *only* them and skips the sub-packs (one listing request instead of one per sub-pack).
 
 ## 7. Compliance
 
-robots.txt: `Disallow: /api/`, `Crawl-delay: 5`. Scraping is one-time, low-frequency, and for
+robots.txt: `Disallow: /api/`, `Crawl-delay: 5`. Scraping is one-time, low-frequency, and for  
 personal use only; level copyrights belong to their respective authors — do not redistribute.
+
+The sitemap route (§3.5) is the path `robots.txt` explicitly advertises, but it is still ~16 MB of  
+XML for 3 requests: run it once, not in a loop.
