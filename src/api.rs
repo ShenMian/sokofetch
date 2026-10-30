@@ -105,13 +105,18 @@ pub struct Listing {
 pub struct Collection {
     pub pack: Pack,
     pub items: Vec<PuzzleItem>,
-    /// Number of sub-packs (`0` for a flat author page).
-    pub groups: usize,
-    /// Levels counted inside those sub-packs.
-    pub grouped: u64,
     /// Levels the site counts for the pack but that no sub-pack holds — they
     /// sit directly on the collection page and are never linked from it.
-    pub hidden: u64,
+    /// `None` when the pack's own counter is missing: then nothing is known.
+    pub hidden: Option<u64>,
+}
+
+/// Levels the pack counts that neither its own listing nor its sub-packs
+/// account for, i.e. the ones sitting directly on the collection page
+/// (docs/API.md §3.2.1). `grouped` is `None` when a sub-pack count is missing,
+/// in which case the arithmetic proves nothing and the answer is `None` too.
+pub fn hidden_estimate(pack: &Pack, grouped: Option<u64>, direct: u64) -> Option<u64> {
+    Some(pack.num_puzzles?.saturating_sub(grouped? + direct))
 }
 
 /// Listing entries come in two shapes: puzzles (`puzzle_id`) and sub-packs
@@ -393,25 +398,22 @@ impl Client {
         // the container itself; the listing only ever returns one of the two.
         // A page without sub-packs returns its own levels, so nothing is hidden.
         let hidden = if groups == 0 {
-            0
+            Some(0)
         } else {
-            pack.num_puzzles
-                .map_or(0, |total| total.saturating_sub(grouped + direct))
+            hidden_estimate(&pack, Some(grouped), direct)
         };
         Ok(Collection {
             pack,
             items,
-            groups,
-            grouped,
             hidden,
         })
     }
 
-    /// Levels that sit directly on a collection page instead of inside one of
-    /// its sub-packs. The pack listing never returns them, so they are read
-    /// from the site's sitemap instead — the one enumeration path `robots.txt`
-    /// advertises (docs/API.md §3.2.1, §3.5).
-    pub fn fetch_ungrouped(
+    /// The levels that sit directly on a collection page instead of inside one
+    /// of its sub-packs. The pack listing never returns them and the API has no
+    /// other way in, so they are read from the site's sitemap — the one
+    /// enumeration path `robots.txt` advertises (docs/API.md §3.2.1, §3.5).
+    pub fn fetch_page_levels(
         &self,
         collection: &str,
         progress: &ProgressBar,
@@ -428,7 +430,7 @@ impl Client {
         let mut ids = BTreeSet::new();
         for (index, shard) in shards.iter().enumerate() {
             progress.set_message(format!(
-                "scanning sitemap {}/{} for ungrouped levels ...",
+                "scanning sitemap {}/{} for levels on the page ...",
                 index + 1,
                 shards.len()
             ));
@@ -640,8 +642,8 @@ mod tests {
     // ---- client behaviour against a local mock server ----
 
     use crate::test_support::{
-        Action, MockServer, Response, wire_detail, wire_listing, wire_pack, wire_pack_item,
-        wire_puzzle_item,
+        Action, MockServer, Response, wire_detail, wire_listing, wire_pack, wire_pack_counted,
+        wire_pack_item, wire_puzzle_item,
     };
 
     /// A mock server + a client aimed at it (short rate-limit delay, no
@@ -989,14 +991,14 @@ mod tests {
 </urlset>"#;
 
     #[test]
-    fn ungrouped_levels_come_from_the_puzzle_sitemaps() {
+    fn page_levels_come_from_the_puzzle_sitemaps() {
         let (server, client) = server_with(|_call, target| match target {
             "/sitemap.xml" => Action::Respond(Response::plain(200, SITEMAP_INDEX)),
             "/sitemaps/puzzles-1.xml" => Action::Respond(Response::plain(200, SITEMAP_SHARD)),
             _ => Action::Respond(Response::plain(500, "unexpected target")),
         });
         let items = client
-            .fetch_ungrouped("obyzz011", &ProgressBar::hidden())
+            .fetch_page_levels("obyzz011", &ProgressBar::hidden())
             .unwrap();
         let ids: Vec<i64> = items.iter().map(|item| item.puzzle_id).collect();
         assert_eq!(ids, [136063, 136074], "direct levels only, sorted");
@@ -1013,7 +1015,7 @@ mod tests {
             ))
         });
         let err = client
-            .fetch_ungrouped("obyzz011", &ProgressBar::hidden())
+            .fetch_page_levels("obyzz011", &ProgressBar::hidden())
             .unwrap_err();
         assert!(err.to_string().contains("no puzzle sitemaps"), "{err:#}");
     }
@@ -1037,12 +1039,30 @@ mod tests {
             Action::Respond(Response::json(200, data))
         });
         let collection = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
-        assert_eq!(collection.groups, 1);
-        assert_eq!(collection.grouped, 2);
         assert_eq!(
-            collection.hidden, 5,
+            collection.hidden,
+            Some(5),
             "the site counts 7 for the pack, its sub-packs hold 2"
         );
+    }
+
+    #[test]
+    fn a_missing_counter_leaves_the_hidden_count_unknown() {
+        let mut without_total = wire_pack("t1024");
+        without_total["numpuzzles"] = serde_json::Value::Null;
+        let without_total: Pack = serde_json::from_value(without_total).expect("pack decodes");
+        // neither side can be proven, so the sitemap has to be consulted
+        assert_eq!(hidden_estimate(&without_total, Some(3), 0), None);
+        assert_eq!(hidden_estimate(&without_total, None, 0), None);
+
+        let counted: Pack = serde_json::from_value(wire_pack_counted("t1024", 9)).expect("decodes");
+        assert_eq!(
+            hidden_estimate(&counted, None, 0),
+            None,
+            "a sub count is missing"
+        );
+        assert_eq!(hidden_estimate(&counted, Some(9), 0), Some(0));
+        assert_eq!(hidden_estimate(&counted, Some(6), 1), Some(2));
     }
 
     #[test]
@@ -1054,7 +1074,6 @@ mod tests {
             ))
         });
         let collection = client.fetch_pack("t1024", &ProgressBar::hidden()).unwrap();
-        assert_eq!(collection.groups, 0);
-        assert_eq!(collection.hidden, 0);
+        assert_eq!(collection.hidden, Some(0));
     }
 }

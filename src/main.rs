@@ -1,11 +1,13 @@
 //! Inspect and fetch author collections from sokobanonline.com.
 //!
-//! `info` describes a collection (its sub-packs and the levels that sit
-//! outside them); `fetch` writes its levels as an XSB level collection (.txt).
-//! The collection is addressed by the path of its page relative to
-//! `sokobanonline.com/play/community/`: `<username>` or `<username>/<pack>`.
-//! Levels that an XSB loader cannot represent (mechanisms, co-op, decoy
-//! boxes) are skipped; docs/API.md documents the API and the board encoding.
+//! A collection is a pack plus every level below it: the levels of its
+//! sub-packs and the ones sitting directly on its page, which the site itself
+//! never links to. `info` describes both kinds and `fetch` downloads both, so
+//! neither needs a flag to be complete. The collection is addressed by the path
+//! of its page relative to `sokobanonline.com/play/community/`: `<username>` or
+//! `<username>/<pack>`. Levels that an XSB loader cannot represent (mechanisms,
+//! co-op, decoy boxes) are skipped; docs/API.md documents the API and the board
+//! encoding.
 
 mod api;
 mod convert;
@@ -20,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -38,7 +40,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Show what a collection holds: its sub-packs and the levels that sit
-    /// outside them
+    /// directly on its page
     Info(InfoArgs),
     /// Fetch a collection's levels as an XSB level collection (.txt)
     Fetch(FetchArgs),
@@ -60,12 +62,6 @@ struct Connection {
     /// Seconds until a single request times out
     #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
     timeout: f64,
-
-    /// Also look at levels that sit directly on the collection page instead of
-    /// inside one of its sub-packs. The site never links to them, so they are
-    /// read from its sitemap (4 extra requests, ~16 MB).
-    #[arg(long)]
-    ungrouped: bool,
 }
 
 #[derive(Debug, Args)]
@@ -91,10 +87,10 @@ struct FetchArgs {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Fetch only the levels that sit directly on the collection page, and
-    /// none of its sub-packs. Implies --ungrouped.
+    /// Keep the levels already in the output file and fetch only the missing
+    /// ones, appending them
     #[arg(long)]
-    only_ungrouped: bool,
+    resume: bool,
 }
 
 impl Command {
@@ -215,8 +211,8 @@ fn run(command: Command, client: &Client, stop: &Arc<AtomicBool>) -> anyhow::Res
     let collection = parse_collection(&command.connection().collection)?;
 
     match command {
-        Command::Info(args) => {
-            info(client, &collection, args.connection.ungrouped)?;
+        Command::Info(_) => {
+            info(client, &collection)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Fetch(args) => {
@@ -242,9 +238,10 @@ fn validate(connection: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print what a collection holds: its sub-packs, plus the levels that belong
-/// to none of them (docs/API.md §3.2.1).
-fn info(client: &Client, collection: &str, ungrouped: bool) -> anyhow::Result<()> {
+/// Print what a collection holds: its sub-packs, plus the levels that sit
+/// directly on the page rather than inside one of them (docs/API.md §3.2.1).
+/// Both kinds are rendered the same way — as rows of one table.
+fn info(client: &Client, collection: &str) -> anyhow::Result<()> {
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(Duration::from_millis(100));
     let (pack, listing) = client.list_pack(collection, &spinner)?;
@@ -262,8 +259,29 @@ fn info(client: &Client, collection: &str, ungrouped: bool) -> anyhow::Result<()
         anstream::println!("  https://www.sokobanonline.com{}", pack.path);
         return Ok(());
     }
+
+    // The counters only say *how many* levels sit on the page, never which
+    // ones; naming them costs the sitemap scan, so it is skipped whenever the
+    // arithmetic proves there are none.
+    let grouped: Option<u64> = listing.packs.iter().map(|sub| sub.num_puzzles).sum();
+    let hidden = api::hidden_estimate(&pack, grouped, listing.puzzles.len() as u64);
+    let on_page = if hidden == Some(0) {
+        Vec::new()
+    } else {
+        let spinner = ProgressBar::new_spinner();
+        spinner.enable_steady_tick(Duration::from_millis(100));
+        let levels = client.fetch_page_levels(collection, &spinner);
+        spinner.finish_and_clear();
+        levels?
+    };
+
+    let suffix = if on_page.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} on the page", on_page.len())
+    };
     anstream::println!(
-        "{} · {} puzzles in {} sub-packs",
+        "{} · {} puzzles in {} sub-packs{suffix}",
         pack.name,
         total,
         listing.packs.len()
@@ -274,6 +292,7 @@ fn info(client: &Client, collection: &str, ungrouped: bool) -> anyhow::Result<()
         .packs
         .iter()
         .map(|sub| api::display_path(&sub.full_slug).chars().count())
+        .chain(std::iter::once("(page)".len()))
         .max()
         .unwrap_or(0);
     anstream::println!();
@@ -289,49 +308,22 @@ fn info(client: &Client, collection: &str, ungrouped: bool) -> anyhow::Result<()
             width = width
         );
     }
-    anstream::println!();
-
-    // The page's own counter includes levels that belong to no sub-pack; the
-    // listing above can never reach them (docs/API.md §3.2.1).
-    let counts: Option<u64> = listing.packs.iter().map(|sub| sub.num_puzzles).sum();
-    let hidden = match (pack.num_puzzles, counts) {
-        (Some(total), Some(grouped)) => total.saturating_sub(grouped),
-        _ => 0,
-    };
-    if !ungrouped {
-        if hidden > 0 {
-            anstream::println!(
-                "  {}",
-                paint(
-                    anstyle::AnsiColor::Yellow,
-                    format!(
-                        "outside every sub-pack: {hidden} \
-                         (not linked from the page; --ungrouped lists them)"
-                    )
-                )
-            );
+    if !on_page.is_empty() {
+        anstream::println!(
+            "  {:<width$}  {:>4}  levels directly on the page",
+            "(page)",
+            on_page.len(),
+            width = width
+        );
+        // The sitemap carries ids, not names; they are what `fetch` works from.
+        let indent = " ".repeat(width + 10);
+        for chunk in on_page.chunks(6) {
+            let ids: Vec<String> = chunk
+                .iter()
+                .map(|item| item.puzzle_id.to_string())
+                .collect();
+            anstream::println!("{indent}{}", ids.join("  "));
         }
-        return Ok(());
-    }
-    let spinner = ProgressBar::new_spinner();
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    let extra = client.fetch_ungrouped(collection, &spinner);
-    spinner.finish_and_clear();
-    let extra = extra?;
-    if extra.is_empty() {
-        anstream::println!("  outside every sub-pack: none");
-        return Ok(());
-    }
-    anstream::println!(
-        "  outside every sub-pack: {} (not linked from the page)",
-        extra.len()
-    );
-    for chunk in extra.chunks(6) {
-        let ids: Vec<String> = chunk
-            .iter()
-            .map(|item| item.puzzle_id.to_string())
-            .collect();
-        anstream::println!("    {}", ids.join("  "));
     }
     Ok(())
 }
@@ -345,40 +337,18 @@ fn fetch_and_write(
     args: &FetchArgs,
     stop: &Arc<AtomicBool>,
 ) -> anyhow::Result<bool> {
-    // Phase 1: learn the puzzle ids. `--only-ungrouped` skips the sub-packs
-    // entirely, so it needs nothing but the container page and the sitemap.
+    // Phase 1: learn the puzzle ids — the collection listing, its sub-packs,
+    // and, only when the counters show levels no sub-pack holds, the sitemap.
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(Duration::from_millis(100));
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.green} {msg}").expect("template is valid"),
     );
     spinner.set_message(format!("listing {collection} ..."));
-    let listing = if args.only_ungrouped {
-        client
-            .list_pack(collection, &spinner)
-            .and_then(|(pack, listing)| {
-                ensure!(
-                    !listing.packs.is_empty(),
-                    "{} has no sub-packs, so every level is already on its page - drop \
-                     --only-ungrouped",
-                    api::display_path(&pack.full_slug)
-                );
-                Ok((pack, Vec::new(), listing.packs.len(), 0, 0))
-            })
-    } else {
-        client.fetch_pack(collection, &spinner).map(|collection| {
-            (
-                collection.pack,
-                collection.items,
-                collection.groups,
-                collection.grouped,
-                collection.hidden,
-            )
-        })
-    };
-    let (pack, mut items, groups, grouped, hidden) = match listing {
-        Ok(listing) => listing,
+    let collected = match client.fetch_pack(collection, &spinner) {
+        Ok(collected) => collected,
         Err(err) => {
+            spinner.finish_and_clear();
             if stop.load(Ordering::Relaxed) {
                 anstream::eprintln!("interrupted");
                 return Ok(true);
@@ -386,54 +356,54 @@ fn fetch_and_write(
             return Err(err);
         }
     };
+    let on_page = if collected.hidden == Some(0) {
+        Vec::new()
+    } else {
+        let levels = client.fetch_page_levels(collection, &spinner)?;
+        let mut seen: HashSet<i64> = collected.items.iter().map(|item| item.puzzle_id).collect();
+        levels
+            .into_iter()
+            .filter(|item| seen.insert(item.puzzle_id))
+            .collect()
+    };
     spinner.finish_and_clear();
+    let pack = collected.pack;
+    let mut items = collected.items;
+    items.extend(on_page);
 
-    // Levels on the container page itself are missing from the listing: the
-    // API only ever returns one of "sub-packs" / "own puzzles" (§3.2.1).
-    let mut ungrouped = 0usize;
-    if args.connection.ungrouped || args.only_ungrouped {
-        let spinner = ProgressBar::new_spinner();
-        spinner.enable_steady_tick(Duration::from_millis(100));
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.green} {msg}").expect("template is valid"),
-        );
-        let extra = client.fetch_ungrouped(collection, &spinner);
-        spinner.finish_and_clear();
-        let extra = extra?;
-        let mut seen: HashSet<i64> = items.iter().map(|item| item.puzzle_id).collect();
-        for item in extra {
-            if seen.insert(item.puzzle_id) {
-                items.push(item);
-                ungrouped += 1;
-            }
-        }
-    } else if hidden > 0 {
-        let total = pack.num_puzzles.unwrap_or(grouped + hidden);
-        anstream::eprintln!(
-            "{} {} of {total} levels sit directly on {}, outside its {groups} sub-packs; the \
-             page never links to them. Re-run with --ungrouped to include them.",
-            paint(anstyle::AnsiColor::Yellow, "warning:"),
-            hidden,
-            api::display_path(&pack.full_slug),
-        );
-    }
+    // Everything already in the output file is left alone when resuming, so a
+    // re-run only pays for the levels that appeared since the last one.
+    let present = if args.resume {
+        existing_ids(out_path)?
+    } else {
+        HashSet::new()
+    };
+    let already = items
+        .iter()
+        .filter(|item| present.contains(&item.puzzle_id))
+        .count();
+    items.retain(|item| !present.contains(&item.puzzle_id));
 
     let items: Vec<_> = match args.limit {
         Some(limit) => items.into_iter().take(limit).collect(),
         None => items,
     };
-    let empty_message = if args.only_ungrouped {
-        format!(
-            "no levels sit outside the sub-packs of {}",
-            api::display_path(&pack.full_slug)
-        )
-    } else {
-        format!(
+    if items.is_empty() {
+        if already > 0 {
+            anstream::println!(
+                "{}: nothing new in {} ({} levels already in {})",
+                paint(anstyle::AnsiColor::Green, "done"),
+                api::display_path(&pack.full_slug),
+                paint(anstyle::AnsiColor::Green, already),
+                out_path.display(),
+            );
+            return Ok(false);
+        }
+        bail!(
             "pack {} holds no puzzles",
             api::display_path(&pack.full_slug)
-        )
-    };
-    ensure!(!items.is_empty(), "{empty_message}");
+        );
+    }
 
     // Phase 2: fetch every puzzle and convert/filter it for the XSB format.
     let progress = ProgressBar::new(items.len() as u64);
@@ -446,7 +416,7 @@ fn fetch_and_write(
     );
 
     let mut kept: Vec<(Puzzle, String)> = Vec::new();
-    let mut fetched = 0usize; // successful detail fetches; the count the header reports
+    let mut fetched = 0usize; // successful detail fetches, reported in the summary
     let mut skipped = 0usize;
     let mut skipped_by = SkipBreakdown::default();
     let mut failed = 0usize;
@@ -467,10 +437,7 @@ fn fetch_and_write(
         match client.fetch_puzzle(item.puzzle_id) {
             Err(err) if !stop.load(Ordering::Relaxed) => {
                 failed += 1;
-                note(
-                    &progress,
-                    &format!("  failed {} {}: {err:#}", item.puzzle_id, item.name),
-                );
+                note(&progress, &format!("  failed {}: {err:#}", item.label()));
             }
             Err(_) => {
                 interrupted = true;
@@ -540,8 +507,7 @@ fn fetch_and_write(
         );
     }
 
-    std::fs::write(out_path, render_output(&pack, fetched, &kept))
-        .with_context(|| format!("writing {}", out_path.display()))?;
+    write_output(out_path, &pack, &kept, args.resume)?;
 
     anstream::println!(
         "{}: kept {}, skipped {}{}, failed {} of {fetched} fetched{} -> {}",
@@ -550,32 +516,99 @@ fn fetch_and_write(
         paint(anstyle::AnsiColor::Yellow, skipped),
         skipped_by.breakdown(),
         paint(anstyle::AnsiColor::Red, failed),
-        match (ungrouped, args.only_ungrouped) {
-            (0, _) => String::new(),
-            (n, true) => format!(
-                ", only the {} outside the sub-packs",
-                paint(anstyle::AnsiColor::Green, n)
-            ),
-            (n, false) => format!(
-                ", {} included from outside the sub-packs",
-                paint(anstyle::AnsiColor::Green, n)
-            ),
+        if already > 0 {
+            format!(
+                ", {} already present",
+                paint(anstyle::AnsiColor::Green, already)
+            )
+        } else {
+            String::new()
         },
         out_path.display(),
     );
     Ok(interrupted)
 }
 
-/// Render the collection: each block is the XSB map followed by `Title:` /
-/// `Author:` / `URL:` metadata lines, which soukoban parses as level metadata.
-fn render_output(pack: &Pack, fetched: usize, kept: &[(Puzzle, String)]) -> String {
+/// Write the collection, appending to an existing file when resuming. The
+/// header is rewritten either way, so its level count always describes the
+/// file as a whole rather than the levels this run happened to fetch.
+fn write_output(
+    path: &Path,
+    pack: &Pack,
+    kept: &[(Puzzle, String)],
+    append: bool,
+) -> anyhow::Result<()> {
+    let blocks = render_blocks(pack, kept);
+    let body = if append && path.exists() {
+        let existing =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut body = strip_header(&existing).trim_end().to_owned();
+        if !body.is_empty() && !blocks.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&blocks);
+        body
+    } else {
+        blocks
+    };
+    let levels = body
+        .lines()
+        .filter(|line| line.starts_with("; URL:"))
+        .count();
+    let text = format!("{}{body}", render_header(pack, levels));
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Drop the leading `;` comment block (and the blank line after it), keeping
+/// the level blocks byte for byte.
+fn strip_header(content: &str) -> &str {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !(trimmed.is_empty() || trimmed.starts_with(';')) {
+            return &content[offset..];
+        }
+        offset += line.len();
+    }
+    ""
+}
+
+/// Puzzle ids already recorded in an output file, read back from its `; URL:`
+/// lines. A missing file simply has none.
+fn existing_ids(path: &Path) -> anyhow::Result<HashSet<i64>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.strip_prefix("; URL: "))
+        .filter_map(|url| url.rsplit('/').next())
+        .filter_map(|tail| match tail.split_once('_') {
+            Some((id, _)) => id.parse().ok(),
+            None => tail.parse().ok(),
+        })
+        .collect())
+}
+
+/// The three `;` header lines, followed by the blank line that separates them
+/// from the first level block.
+fn render_header(pack: &Pack, levels: usize) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "; Sokoban Online - {} ({})", pack.name, pack.path);
-    let _ = writeln!(out, "; {} XSB levels of {fetched} fetched", kept.len());
+    let _ = writeln!(out, "; {levels} XSB levels");
     let _ = writeln!(
         out,
         "; classic puzzles only - modern puzzles are excluded\n"
     );
+    out
+}
+
+/// Render the level blocks: each is the XSB map followed by `Title:` /
+/// `Author:` / `URL:` metadata lines, which soukoban parses as level metadata.
+fn render_blocks(pack: &Pack, kept: &[(Puzzle, String)]) -> String {
+    let mut out = String::new();
     for (index, (puzzle, board)) in kept.iter().enumerate() {
         if index > 0 {
             out.push('\n');
@@ -622,7 +655,11 @@ mod tests {
     #[test]
     fn output_blocks_carry_metadata() {
         let (pack, puzzle) = fixture();
-        let out = render_output(&pack, 1, &[(puzzle, "####".into())]);
+        let out = format!(
+            "{}{}",
+            render_header(&pack, 1),
+            render_blocks(&pack, &[(puzzle, "####".into())])
+        );
         // map first, metadata after
         assert!(out.contains("\n####\nTitle: corner01\n"));
         assert!(out.contains("Author: T1024\n"));
@@ -640,7 +677,11 @@ mod tests {
     #[test]
     fn emitted_block_parses_as_soukoban_level() {
         let (pack, puzzle) = fixture();
-        let out = render_output(&pack, 1, &[(puzzle, "#####\n#@$.#\n#####".into())]);
+        let out = format!(
+            "{}{}",
+            render_header(&pack, 1),
+            render_blocks(&pack, &[(puzzle, "#####\n#@$.#\n#####".into())])
+        );
         let block = out
             .split("\n\n")
             .nth(1)
@@ -686,20 +727,27 @@ mod tests {
 
     #[test]
     fn subcommands_keep_their_own_options() {
-        let cli = Cli::parse_from(["sokofetch", "info", "obyzz011", "--ungrouped"]);
+        let cli = Cli::parse_from(["sokofetch", "info", "obyzz011"]);
         match cli.command {
-            Command::Info(args) => {
-                assert_eq!(args.connection.collection, "obyzz011");
-                assert!(args.connection.ungrouped);
-            }
+            Command::Info(args) => assert_eq!(args.connection.collection, "obyzz011"),
             Command::Fetch(_) => panic!("expected the info subcommand"),
         }
 
-        let cli = Cli::parse_from(["sokofetch", "fetch", "a/b", "-o", "x.txt", "--limit", "5"]);
+        let cli = Cli::parse_from([
+            "sokofetch",
+            "fetch",
+            "a/b",
+            "-o",
+            "x.txt",
+            "--limit",
+            "5",
+            "--resume",
+        ]);
         match cli.command {
             Command::Fetch(args) => {
                 assert_eq!(args.output.as_deref(), Some(Path::new("x.txt")));
                 assert_eq!(args.limit, Some(5));
+                assert!(args.resume);
             }
             Command::Info(_) => panic!("expected the fetch subcommand"),
         }
@@ -707,13 +755,16 @@ mod tests {
         // output options belong to `fetch` only, and a subcommand is required
         assert!(Cli::try_parse_from(["sokofetch", "info", "x", "-o", "y"]).is_err());
         assert!(Cli::try_parse_from(["sokofetch", "x"]).is_err());
+        // both subcommands cover the whole collection: there is nothing to opt in
+        assert!(Cli::try_parse_from(["sokofetch", "info", "x", "--ungrouped"]).is_err());
+        assert!(Cli::try_parse_from(["sokofetch", "fetch", "x", "--only-ungrouped"]).is_err());
     }
 
     // ---- end-to-end tests against a local mock of the API ----
 
     use crate::test_support::{
-        Action, MockServer, Response, wire_detail, wire_listing, wire_pack, wire_pack_counted,
-        wire_pack_item, wire_puzzle_item,
+        Action, MockServer, Response, wire_detail, wire_listing, wire_pack_counted, wire_pack_item,
+        wire_puzzle_item,
     };
     use std::sync::atomic::AtomicUsize;
 
@@ -734,7 +785,6 @@ mod tests {
             collection: collection.to_owned(),
             delay: 0.0,
             timeout: 5.0,
-            ungrouped: false,
         }
     }
 
@@ -745,7 +795,7 @@ mod tests {
             output: Some(out.to_path_buf()),
             limit: None,
             verbose: false,
-            only_ungrouped: false,
+            resume: false,
         }
     }
 
@@ -825,7 +875,7 @@ mod tests {
         );
         let text = std::fs::read_to_string(&out).expect("output file");
         assert!(text.contains("; Sokoban Online - t1024 (/play/community/t1024)"));
-        assert!(text.contains("; 2 XSB levels of 2 fetched"));
+        assert!(text.contains("; 2 XSB levels"));
         assert!(text.contains("Title: p11\n"));
         assert!(text.contains("Title: p12\n"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -881,7 +931,7 @@ mod tests {
         let code = run(fetch_cmd("t1024", &out), &client, &stop).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 1 XSB levels of 3 fetched"));
+        assert!(text.contains("; 1 XSB levels"));
         assert!(text.contains("Title: p1\n"));
         assert!(!text.contains("Title: p2\n"));
         assert!(!text.contains("Title: p3\n"));
@@ -901,7 +951,7 @@ mod tests {
             ExitCode::SUCCESS
         );
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 1 XSB levels of 3 fetched"));
+        assert!(text.contains("; 1 XSB levels"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -925,7 +975,7 @@ mod tests {
             .count();
         assert_eq!(detail_calls, 4, "503 is retried across all attempts");
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 0 XSB levels of 0 fetched"));
+        assert!(text.contains("; 0 XSB levels"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -992,7 +1042,7 @@ mod tests {
             .count();
         assert_eq!(detail_calls, 1, "the stop flag halts after item 1");
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 1 XSB levels of 1 fetched"));
+        assert!(text.contains("; 1 XSB levels"));
         assert!(text.contains("Title: p1\n"));
         assert!(!text.contains("Title: p2"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1023,7 +1073,7 @@ mod tests {
             .count();
         assert_eq!(detail_calls, 1, "the stop flag halts the retry loop");
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 0 XSB levels of 0 fetched"));
+        assert!(text.contains("; 0 XSB levels"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1045,7 +1095,9 @@ mod tests {
             Action::Respond(Response::json(
                 200,
                 wire_listing(
-                    Some(wire_pack("t1024")),
+                    // the counter accounts for both sub-packs (3 + 3), so no
+                    // level sits on the page and no sitemap scan is needed
+                    Some(wire_pack_counted("t1024", 6)),
                     vec![
                         wire_pack_item("community/t1024/corner-set"),
                         wire_pack_item("community/t1024/box-world"),
@@ -1134,7 +1186,7 @@ mod tests {
         );
     }
 
-    // ---- levels outside every sub-pack (docs/API.md §3.2.1) ----
+    // ---- levels that sit directly on the page (docs/API.md §3.2.1) ----
 
     const SITEMAP_INDEX: &str = r#"<sitemapindex>
 <sitemap><loc>https://www.sokobanonline.com/sitemaps/packs.xml</loc></sitemap>
@@ -1150,7 +1202,7 @@ mod tests {
 
     /// A container page whose sub-pack holds `11`, while the pack counter says
     /// the collection has one more level — the one that lives on the page.
-    fn ungrouped_handler() -> impl Fn(usize, &str) -> Action + Send + Sync + 'static {
+    fn page_levels_handler() -> impl Fn(usize, &str) -> Action + Send + Sync + 'static {
         |_call, target| match target {
             "/sitemap.xml" => Action::Respond(Response::plain(200, SITEMAP_INDEX)),
             "/sitemaps/puzzles-1.xml" => Action::Respond(Response::plain(200, SITEMAP_SHARD)),
@@ -1183,14 +1235,12 @@ mod tests {
     }
 
     #[test]
-    fn run_ungrouped_adds_the_levels_that_live_on_the_page() {
-        let dir = scratch_dir("ungrouped");
+    fn run_fetches_the_levels_that_live_on_the_page() {
+        let dir = scratch_dir("page-levels");
         let out = dir.join("out.txt");
-        let (server, client, stop) = mock(ungrouped_handler());
-        let mut args = fetch_args("t1024", &out);
-        args.connection.ungrouped = true;
+        let (server, client, stop) = mock(page_levels_handler());
         assert_eq!(
-            run(Command::Fetch(args), &client, &stop).unwrap(),
+            run(fetch_cmd("t1024", &out), &client, &stop).unwrap(),
             ExitCode::SUCCESS
         );
         assert_eq!(
@@ -1205,62 +1255,17 @@ mod tests {
             ]
         );
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 2 XSB levels of 2 fetched"));
+        assert!(text.contains("; 2 XSB levels"));
         assert!(text.contains("Title: p11\n"));
         assert!(text.contains("Title: p99\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn run_only_ungrouped_skips_every_sub_pack() {
-        let dir = scratch_dir("only-ungrouped");
+    fn run_skips_the_sitemap_when_the_counters_prove_nothing_is_hidden() {
+        let dir = scratch_dir("no-page-levels");
         let out = dir.join("out.txt");
-        let (server, client, stop) = mock(ungrouped_handler());
-        let mut args = fetch_args("t1024", &out);
-        args.only_ungrouped = true;
-        assert_eq!(
-            run(Command::Fetch(args), &client, &stop).unwrap(),
-            ExitCode::SUCCESS
-        );
-        assert_eq!(
-            server.calls(),
-            [
-                "/packs/by-path/community/t1024?page=1",
-                "/sitemap.xml",
-                "/sitemaps/puzzles-1.xml",
-                "/puzzles/99"
-            ],
-            "the sub-pack is neither listed nor fetched"
-        );
-        let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 1 XSB levels of 1 fetched"));
-        assert!(text.contains("Title: p99\n"));
-        assert!(!text.contains("Title: p11"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn run_only_ungrouped_rejects_a_page_without_sub_packs() {
-        let dir = scratch_dir("only-ungrouped-flat");
-        let out = dir.join("out.txt");
-        let (_server, client, stop) = mock(|_call, _target| listing_of(&[11]));
-        let mut args = fetch_args("t1024", &out);
-        args.only_ungrouped = true;
-        let err = run(Command::Fetch(args), &client, &stop).unwrap_err();
-        assert!(err.to_string().contains("has no sub-packs"), "{err:#}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn run_only_ungrouped_fails_when_nothing_lives_on_the_page() {
-        let dir = scratch_dir("only-ungrouped-empty");
-        let out = dir.join("out.txt");
-        let (_server, client, stop) = mock(|_call, target| match target {
-            "/sitemap.xml" => Action::Respond(Response::plain(200, SITEMAP_INDEX)),
-            "/sitemaps/puzzles-1.xml" => Action::Respond(Response::plain(
-                200,
-                "<urlset><url><loc>https://www.sokobanonline.com/play/community/t1024/corner-set/11_p11</loc></url></urlset>",
-            )),
+        let (server, client, stop) = mock(|_call, target| match target {
             "/packs/by-path/community/t1024?page=1" => Action::Respond(Response::json(
                 200,
                 wire_listing(
@@ -1269,32 +1274,129 @@ mod tests {
                     1,
                 ),
             )),
+            "/packs/by-path/community/t1024/corner-set?page=1" => Action::Respond(Response::json(
+                200,
+                wire_listing(
+                    Some(wire_pack_counted("corner-set", 1)),
+                    vec![wire_puzzle_item(11)],
+                    1,
+                ),
+            )),
+            t if t.starts_with("/puzzles/") => detail_action(11),
             _ => Action::Respond(Response::plain(500, "unexpected target")),
         });
-        let mut args = fetch_args("t1024", &out);
-        args.only_ungrouped = true;
-        let err = run(Command::Fetch(args), &client, &stop).unwrap_err();
-        assert!(err.to_string().contains("no levels sit outside"), "{err:#}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn run_without_ungrouped_never_touches_the_sitemap() {
-        let dir = scratch_dir("grouped-only");
-        let out = dir.join("out.txt");
-        let (server, client, stop) = mock(ungrouped_handler());
         assert_eq!(
             run(fetch_cmd("t1024", &out), &client, &stop).unwrap(),
             ExitCode::SUCCESS
         );
         assert!(
             !server.calls().iter().any(|t| t.contains("sitemap")),
-            "{:?}",
+            "the counters account for every level: {:?}",
+            server.calls()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file holding just level `11`, as an earlier run would have left it.
+    const RESUME_FILE: &str = "; Sokoban Online - t1024 (/play/community/t1024)
+; 1 XSB levels
+; classic puzzles only - modern puzzles are excluded
+
+#####
+#@$.#
+#####
+Title: p11
+Author: T1024
+; URL: https://www.sokobanonline.com/play/community/t1024/11_p11
+";
+
+    #[test]
+    fn run_resume_only_fetches_the_levels_missing_from_the_file() {
+        let dir = scratch_dir("resume");
+        let out = dir.join("out.txt");
+        std::fs::write(&out, RESUME_FILE).expect("seed output file");
+        let (server, client, stop) = mock(page_levels_handler());
+        let mut args = fetch_args("t1024", &out);
+        args.resume = true;
+        assert_eq!(
+            run(Command::Fetch(args), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            server
+                .calls()
+                .iter()
+                .filter(|t| t.starts_with("/puzzles/"))
+                .count(),
+            1,
+            "only the missing level is fetched: {:?}",
             server.calls()
         );
         let text = std::fs::read_to_string(&out).expect("output file");
-        assert!(text.contains("; 1 XSB levels of 1 fetched"));
-        assert!(!text.contains("Title: p99"));
+        assert_eq!(
+            text.matches("Title: p11\n").count(),
+            1,
+            "the level already in the file is not duplicated"
+        );
+        assert!(text.contains("Title: p99\n"));
+        // the header describes the file, not the levels this run happened to add
+        assert!(text.contains("; 2 XSB levels"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_resume_reports_when_the_file_is_already_complete() {
+        let dir = scratch_dir("resume-complete");
+        let out = dir.join("out.txt");
+        let (server, client, stop) = mock(page_levels_handler());
+        assert_eq!(
+            run(fetch_cmd("t1024", &out), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let first = std::fs::read_to_string(&out).expect("output file");
+
+        let calls_before = server.calls().len();
+        let mut args = fetch_args("t1024", &out);
+        args.resume = true;
+        assert_eq!(
+            run(Command::Fetch(args), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            server.calls().len() - calls_before,
+            4,
+            "the listings and the sitemap, no detail fetch: {:?}",
+            &server.calls()[calls_before..]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).expect("output file"),
+            first,
+            "a complete file is left untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_resume_without_an_existing_file_fetches_everything() {
+        let dir = scratch_dir("resume-fresh");
+        let out = dir.join("out.txt");
+        let (server, client, stop) = mock(page_levels_handler());
+        let mut args = fetch_args("t1024", &out);
+        args.resume = true;
+        assert_eq!(
+            run(Command::Fetch(args), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            server
+                .calls()
+                .iter()
+                .filter(|t| t.starts_with("/puzzles/"))
+                .count(),
+            2
+        );
+        let text = std::fs::read_to_string(&out).expect("output file");
+        assert!(text.contains("; 2 XSB levels"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

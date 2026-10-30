@@ -152,8 +152,8 @@ Observed instances (2026-10-28):
 
 **Impact on this CLI**: scraping a `"packs"` author page misses exactly these orphans — they are not in  
 any child pack and the pack endpoints cannot return them. They *can* be enumerated from the site's  
-sitemap (§3.5), which is what `--ungrouped` does; the pack counter makes the miss detectable  
-(`Collection::hidden` in `src/api.rs`).
+sitemap (§3.5), which is what the CLI does; the pack counter makes the miss detectable, so the scan is  
+skipped whenever the counters account for every level (`Collection::hidden` in `src/api.rs`).
 
 ### 3.3 `GET /api/v1/puzzles/{puzzleid}` ✅ Verified
 
@@ -196,7 +196,7 @@ so the sitemaps — not the API — are the crawl path the site itself sanctions
 | URL                             | Contents                                                                      |
 | ------------------------------- | ----------------------------------------------------------------------------- |
 | `/sitemap.xml`                  | `<sitemapindex>`: `pages.xml`, `packs.xml`, `puzzles-1.xml` … `puzzles-3.xml` |
-| `/sitemaps/puzzles-{1,2,3}.xml` | 45 000 / 45 000 / 41 424 `<loc>` entries — 131 424 total, ~16 MB combined     |
+| `/sitemaps/puzzles-{1,2,3}.xml` | 45 000 / 45 000 / 41 424 `<loc>` entries — 131 424 total, ~16 MB combined (~1.1 MB gzipped) |
 | `/sitemaps/packs.xml`           | Pack pages (not needed here)                                                  |
 
 Puzzle URLs come in three shapes:
@@ -207,13 +207,14 @@ Puzzle URLs come in three shapes:
 /play/web-archive/{author}/{pack}/{id}_{slug}     <- imported web archives
 ```
 
-The number of segments after the author slug is what identifies an ungrouped level: exactly one means  
+The number of segments after the author slug is what identifies a level sitting on the page: exactly one means  
 the level hangs off the author's root container pack, i.e. it is one of the levels §3.2.1 describes.  
 Matching `<loc>` against `play/{collection}/` and keeping single-segment remainders reproduces the  
 hidden set exactly (2026-10-28: obyzz011 4 of 4, t1024 4 of 4 — both equal to  
 `numpuzzles − Σ sub-packs`).
 
-Cost: one request for the index plus one per shard; `sokofetch --ungrouped` pays it once per run.
+Cost: one request for the index plus one per shard; the CLI pays it at most once per run, and  
+only when the pack counters show levels that no sub-pack holds.
 
 ## 4. `design` Board Encoding Specification
 
@@ -324,14 +325,15 @@ map + trailing `Title:`/`Author:`/`URL:` metadata lines; supports membercontaine
 **keeps only classic levels, skips all modern ones**.
 
 `cargo run -- info <slug>` prints the same structure without fetching levels: the sub-packs with  
-their counts, plus how many levels belong to none of them (§3.2.1). `--ungrouped` extends either  
-subcommand to those levels, recovering their ids from the sitemap (§3.5); `fetch --only-ungrouped`
-fetches *only* them and skips the sub-packs (one listing request instead of one per sub-pack).
+their counts, plus the levels that sit directly on the page (§3.2.1) — always part of the  
+collection, no flag needed. `fetch` downloads both kinds, consulting the sitemap (§3.5) only when  
+the counters show something is on the page to recover; `fetch --resume` skips the levels already  
+in the output file and appends the rest.
 
 ## 7. Compliance
 
 robots.txt: `Disallow: /api/`, `Crawl-delay: 5`. Scraping is one-time, low-frequency, and for  
 personal use only; level copyrights belong to their respective authors — do not redistribute.
 
-The sitemap route (§3.5) is the path `robots.txt` explicitly advertises, but it is still ~16 MB of  
-XML for 3 requests: run it once, not in a loop.
+The sitemap route (§3.5) is the path `robots.txt` explicitly advertises, but it is still ~1 MB  
+compressed (~16 MB of XML) for 3 requests: run it once, not in a loop.
