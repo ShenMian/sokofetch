@@ -1,6 +1,6 @@
 [package]
 name = "sokobanonline"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "Fetch one author's levels from sokobanonline.com into an XSB level collection (.txt)"
 
