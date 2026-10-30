@@ -4,10 +4,11 @@
 //! sub-packs and the ones sitting directly on its page, which the site itself
 //! never links to. `info` describes both kinds and `fetch` downloads both, so
 //! neither needs a flag to be complete. The collection is addressed by the path
-//! of its page relative to `sokobanonline.com/play/community/`: `<username>` or
-//! `<username>/<pack>`. Levels that an XSB loader cannot represent (mechanisms,
-//! co-op, decoy boxes) are skipped; docs/API.md documents the API and the board
-//! encoding.
+//! of its page relative to `sokobanonline.com/play/community/`: `<author>`,
+//! `<author>/<pack>`, or `<author>/` for the levels on the page itself — the one
+//! collection that has no name. Levels that an XSB loader cannot represent
+//! (mechanisms, co-op, decoy boxes) are skipped; docs/API.md documents the API
+//! and the board encoding.
 
 mod api;
 mod convert;
@@ -26,7 +27,7 @@ use anyhow::{Context, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::api::{Client, Pack, Puzzle};
+use crate::api::{Client, Collection, Pack, Puzzle};
 
 /// Fetch levels of an author collection from sokobanonline.com and write an
 /// XSB level collection (.txt).
@@ -49,9 +50,10 @@ enum Command {
 /// What every request-making subcommand shares.
 #[derive(Debug, Args)]
 struct Connection {
-    /// Collection path: `<username>[/<pack>]` — the path segments of the
-    /// sokobanonline.com/play/community/... URL. `<username>` alone means the
-    /// whole author (sub-packs merged).
+    /// Collection path: `<author>`, `<author>/<pack>`, or `<author>/` for the
+    /// levels sitting directly on the author's page. `<author>` alone means the
+    /// whole author (sub-packs merged); the trailing slash names the one
+    /// collection that has no name of its own
     #[arg(value_name = "COLLECTION")]
     collection: String,
 
@@ -182,45 +184,89 @@ impl SkipBreakdown {
     }
 }
 
-/// Validate the collection path: `<username>[/<pack>...]`, with the allowed
-/// characters (`[a-zA-Z0-9_-]`) per path segment.
-fn parse_collection(input: &str) -> anyhow::Result<String> {
-    let collection = input.trim();
-    ensure!(!collection.is_empty(), "empty collection path");
+/// What a collection path addresses.
+///
+/// An author page is a container holding named sub-collections (its sub-packs)
+/// *and* one that has no name at all: the levels sitting directly on the page,
+/// which no sub-pack contains (docs/API.md §3.2.1). The path mirrors that, so
+/// the empty name after the slash is the unnamed collection rather than a
+/// separate mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    /// `<author>`: the author and every collection below it.
+    Author(String),
+    /// `<author>/<pack>`: one named sub-collection.
+    Pack(String),
+    /// `<author>/`: the collection that has no name.
+    Page(String),
+}
+
+impl Target {
+    /// Path after `community/`, i.e. what the API is asked about.
+    fn path(&self) -> &str {
+        match self {
+            Self::Author(author) | Self::Page(author) => author,
+            Self::Pack(pack) => pack,
+        }
+    }
+}
+
+/// Validate the collection path and say what it addresses: `<author>`,
+/// `<author>/<pack>`, or `<author>/` for the one collection that has no name.
+/// Allowed characters per segment are `[a-zA-Z0-9_-]`.
+fn parse_collection(input: &str) -> anyhow::Result<Target> {
+    let trimmed = input.trim();
+    ensure!(!trimmed.is_empty(), "empty collection path");
+    // A trailing slash names the empty collection, i.e. the levels sitting on
+    // the page itself. A pack holds no sub-packs, so there the empty name
+    // resolves to the pack's own levels — the same thing.
+    let (path, unnamed) = match trimmed.strip_suffix('/') {
+        Some(rest) => (rest, true),
+        None => (trimmed, false),
+    };
     ensure!(
-        collection.split('/').all(|segment| {
+        path.split('/').all(|segment| {
             !segment.is_empty()
                 && segment
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         }),
-        "invalid collection path {collection:?} (expected <username>[/<pack>...], \
+        "invalid collection path {trimmed:?} (expected <author>[/<pack>], \
          allowed characters [a-zA-Z0-9_-])"
     );
-    Ok(collection.to_owned())
+    Ok(match path.split_once('/') {
+        None if unnamed => Target::Page(path.to_owned()),
+        None => Target::Author(path.to_owned()),
+        Some(_) => Target::Pack(path.to_owned()),
+    })
 }
 
 /// Default output name: path segments joined with `-`, so collections of
-/// different authors cannot silently overwrite each other.
-fn default_output(collection: &str) -> PathBuf {
-    PathBuf::from(format!("{}.txt", collection.replace('/', "-")))
+/// different authors cannot silently overwrite each other. The unnamed
+/// collection gets a `-page` suffix rather than a dangling `-`.
+fn default_output(target: &Target) -> PathBuf {
+    match target {
+        Target::Author(author) => PathBuf::from(format!("{author}.txt")),
+        Target::Pack(pack) => PathBuf::from(format!("{}.txt", pack.replace('/', "-"))),
+        Target::Page(author) => PathBuf::from(format!("{author}-page.txt")),
+    }
 }
 
 fn run(command: Command, client: &Client, stop: &Arc<AtomicBool>) -> anyhow::Result<ExitCode> {
     validate(command.connection())?;
-    let collection = parse_collection(&command.connection().collection)?;
+    let target = parse_collection(&command.connection().collection)?;
 
     match command {
         Command::Info(_) => {
-            info(client, &collection)?;
+            info(client, &target)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Fetch(args) => {
             let out_path = args
                 .output
                 .clone()
-                .unwrap_or_else(|| default_output(&collection));
-            let interrupted = fetch_and_write(client, &collection, &out_path, &args, stop)?;
+                .unwrap_or_else(|| default_output(&target));
+            let interrupted = fetch_and_write(client, &target, &out_path, &args, stop)?;
             Ok(if interrupted {
                 ExitCode::from(130)
             } else {
@@ -238,10 +284,58 @@ fn validate(connection: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print what a collection holds: its sub-packs, plus the levels that sit
+/// Print what a collection path addresses.
+fn info(client: &Client, target: &Target) -> anyhow::Result<()> {
+    match target {
+        Target::Page(author) => info_unnamed(client, author),
+        _ => info_container(client, target),
+    }
+}
+
+/// Describe the collection that has no name: the levels sitting directly on an
+/// author's page, outside every sub-pack.
+fn info_unnamed(client: &Client, author: &str) -> anyhow::Result<()> {
+    let spinner = ProgressBar::new_spinner();
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    let (pack, listing) = client.list_pack(author, &spinner)?;
+    // Nothing is named on a flat page, so its unnamed collection is all of it.
+    // Elsewhere the sitemap is the only way to know which levels these are, so
+    // it is read even when the counters claim there are none: they are the
+    // site's own tally and can be stale, while this is the whole answer.
+    let levels = if listing.packs.is_empty() {
+        listing.puzzles
+    } else {
+        client.fetch_page_levels(author, &spinner)?
+    };
+    spinner.finish_and_clear();
+
+    if levels.is_empty() {
+        anstream::println!("{} · no levels directly on the page", pack.name);
+        anstream::println!("  https://www.sokobanonline.com{}", pack.path);
+        return Ok(());
+    }
+    anstream::println!(
+        "{} · {} levels directly on the page",
+        pack.name,
+        levels.len()
+    );
+    anstream::println!("  https://www.sokobanonline.com{}", pack.path);
+    anstream::println!();
+    for chunk in levels.chunks(6) {
+        let ids: Vec<String> = chunk
+            .iter()
+            .map(|item| item.puzzle_id.to_string())
+            .collect();
+        anstream::println!("  {}", ids.join("  "));
+    }
+    Ok(())
+}
+
+/// Print what a container holds: its sub-packs, plus the levels that sit
 /// directly on the page rather than inside one of them (docs/API.md §3.2.1).
 /// Both kinds are rendered the same way — as rows of one table.
-fn info(client: &Client, collection: &str) -> anyhow::Result<()> {
+fn info_container(client: &Client, target: &Target) -> anyhow::Result<()> {
+    let collection = target.path();
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(Duration::from_millis(100));
     let (pack, listing) = client.list_pack(collection, &spinner)?;
@@ -252,9 +346,13 @@ fn info(client: &Client, collection: &str) -> anyhow::Result<()> {
         .map_or_else(|| "?".to_owned(), |n| n.to_string());
     if listing.packs.is_empty() {
         anstream::println!(
-            "{} · {} puzzles, all directly on the page",
+            "{} · {} puzzles{}",
             pack.name,
-            listing.puzzles.len()
+            listing.puzzles.len(),
+            match target {
+                Target::Author(_) => ", all directly on the page",
+                _ => "",
+            }
         );
         anstream::println!("  https://www.sokobanonline.com{}", pack.path);
         return Ok(());
@@ -332,7 +430,7 @@ fn info(client: &Client, collection: &str) -> anyhow::Result<()> {
 /// Returns `true` when the user interrupted the fetch.
 fn fetch_and_write(
     client: &Client,
-    collection: &str,
+    target: &Target,
     out_path: &Path,
     args: &FetchArgs,
     stop: &Arc<AtomicBool>,
@@ -344,8 +442,30 @@ fn fetch_and_write(
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.green} {msg}").expect("template is valid"),
     );
-    spinner.set_message(format!("listing {collection} ..."));
-    let collected = match client.fetch_pack(collection, &spinner) {
+    spinner.set_message(format!("listing {} ...", target.path()));
+    let collected = match target {
+        // The unnamed collection: one listing to confirm the author exists and
+        // to know whether anything is named, then only the levels on the page.
+        Target::Page(author) => client
+            .list_pack(author, &spinner)
+            .and_then(|(pack, listing)| {
+                // The counters only hint at how many there are, and this
+                // collection is exactly what was asked for: read the sitemap.
+                let items = if listing.packs.is_empty() {
+                    // nothing is named, so the unnamed collection is the page
+                    listing.puzzles
+                } else {
+                    client.fetch_page_levels(author, &spinner)?
+                };
+                Ok(Collection {
+                    pack,
+                    items,
+                    hidden: Some(0),
+                })
+            }),
+        _ => client.fetch_pack(target.path(), &spinner),
+    };
+    let collected = match collected {
         Ok(collected) => collected,
         Err(err) => {
             spinner.finish_and_clear();
@@ -359,7 +479,7 @@ fn fetch_and_write(
     let on_page = if collected.hidden == Some(0) {
         Vec::new()
     } else {
-        let levels = client.fetch_page_levels(collection, &spinner)?;
+        let levels = client.fetch_page_levels(target.path(), &spinner)?;
         let mut seen: HashSet<i64> = collected.items.iter().map(|item| item.puzzle_id).collect();
         levels
             .into_iter()
@@ -400,8 +520,17 @@ fn fetch_and_write(
             return Ok(false);
         }
         bail!(
-            "pack {} holds no puzzles",
-            api::display_path(&pack.full_slug)
+            "{}",
+            match target {
+                Target::Page(_) => format!(
+                    "no levels sit directly on the page of {}",
+                    api::display_path(&pack.full_slug)
+                ),
+                _ => format!(
+                    "pack {} holds no puzzles",
+                    api::display_path(&pack.full_slug)
+                ),
+            }
         );
     }
 
@@ -706,23 +835,45 @@ mod tests {
 
     #[test]
     fn collection_paths_are_parsed_and_validated() {
-        assert_eq!(parse_collection("a").unwrap(), "a");
-        assert_eq!(parse_collection(" a/b ").unwrap(), "a/b");
-        assert!(parse_collection("a//b").is_err()); // empty segment
+        let author = |s: &str| Target::Author(s.to_owned());
+        let pack = |s: &str| Target::Pack(s.to_owned());
+        let page = |s: &str| Target::Page(s.to_owned());
+
+        assert_eq!(parse_collection("a").unwrap(), author("a"));
+        assert_eq!(parse_collection(" a/b ").unwrap(), pack("a/b"));
+        // the empty name after the slash is the collection that has none
+        assert_eq!(parse_collection("a/").unwrap(), page("a"));
+        assert_eq!(parse_collection(" a/ ").unwrap(), page("a"));
+        // a pack holds no sub-packs, so its empty name resolves to itself
+        assert_eq!(parse_collection("a/b/").unwrap(), pack("a/b"));
+
+        assert!(parse_collection("a//").is_err()); // empty segment
         assert!(parse_collection("").is_err());
         assert!(parse_collection(" ").is_err());
+        assert!(parse_collection("/").is_err()); // no author at all
         assert!(parse_collection("https://example.com").is_err()); // ':' invalid
         assert!(parse_collection("a b").is_err()); // space invalid
     }
 
     #[test]
     fn default_output_joins_path_segments() {
-        assert_eq!(default_output("t1024"), PathBuf::from("t1024.txt"));
         assert_eq!(
-            default_output("t1024/corner-set"),
+            default_output(&Target::Author("t1024".into())),
+            PathBuf::from("t1024.txt")
+        );
+        assert_eq!(
+            default_output(&Target::Pack("t1024/corner-set".into())),
             PathBuf::from("t1024-corner-set.txt")
         );
-        assert_eq!(default_output("a/b/c"), PathBuf::from("a-b-c.txt"));
+        assert_eq!(
+            default_output(&Target::Pack("a/b/c".into())),
+            PathBuf::from("a-b-c.txt")
+        );
+        // the unnamed collection never shares a file with the whole author
+        assert_eq!(
+            default_output(&Target::Page("t1024".into())),
+            PathBuf::from("t1024-page.txt")
+        );
     }
 
     #[test]
@@ -764,7 +915,7 @@ mod tests {
 
     use crate::test_support::{
         Action, MockServer, Response, wire_detail, wire_listing, wire_pack_counted, wire_pack_item,
-        wire_puzzle_item,
+        wire_pack_item_counted, wire_puzzle_item,
     };
     use std::sync::atomic::AtomicUsize;
 
@@ -1210,7 +1361,9 @@ mod tests {
                 200,
                 wire_listing(
                     Some(wire_pack_counted("t1024", 2)),
-                    vec![wire_pack_item("community/t1024/corner-set")],
+                    // the counter matches the one level the sub-pack holds, so
+                    // the arithmetic alone says one level sits on the page
+                    vec![wire_pack_item_counted("community/t1024/corner-set", 1)],
                     1,
                 ),
             )),
@@ -1270,7 +1423,7 @@ mod tests {
                 200,
                 wire_listing(
                     Some(wire_pack_counted("t1024", 1)),
-                    vec![wire_pack_item("community/t1024/corner-set")],
+                    vec![wire_pack_item_counted("community/t1024/corner-set", 1)],
                     1,
                 ),
             )),
@@ -1295,6 +1448,71 @@ mod tests {
             server.calls()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_unnamed_collection_fetches_only_the_levels_on_the_page() {
+        let dir = scratch_dir("unnamed");
+        let out = dir.join("out.txt");
+        let (server, client, stop) = mock(page_levels_handler());
+        assert_eq!(
+            run(fetch_cmd("t1024/", &out), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            server.calls(),
+            [
+                "/packs/by-path/community/t1024?page=1",
+                "/sitemap.xml",
+                "/sitemaps/puzzles-1.xml",
+                "/puzzles/99"
+            ],
+            "the sub-pack is neither listed nor fetched"
+        );
+        let text = std::fs::read_to_string(&out).expect("output file");
+        assert!(text.contains("; 1 XSB levels"));
+        assert!(text.contains("Title: p99\n"));
+        assert!(!text.contains("Title: p11"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_a_pack_with_a_trailing_slash_is_still_that_pack() {
+        let dir = scratch_dir("pack-slash");
+        let out = dir.join("out.txt");
+        let (server, client, stop) = mock(fetch_handler(&[11, 12]));
+        assert_eq!(
+            run(fetch_cmd("t1024/corner-set/", &out), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            server.calls(),
+            [
+                "/packs/by-path/community/t1024/corner-set?page=1",
+                "/puzzles/11",
+                "/puzzles/12"
+            ],
+            "a pack holds no sub-packs, so the empty name adds nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn info_unnamed_collection_lists_only_the_levels_on_the_page() {
+        let (server, client, stop) = mock(page_levels_handler());
+        assert_eq!(
+            run(info_cmd("t1024/"), &client, &stop).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            server.calls(),
+            [
+                "/packs/by-path/community/t1024?page=1",
+                "/sitemap.xml",
+                "/sitemaps/puzzles-1.xml"
+            ],
+            "no sub-pack listing and no puzzle details"
+        );
     }
 
     /// A file holding just level `11`, as an earlier run would have left it.

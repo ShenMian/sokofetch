@@ -328,7 +328,8 @@ map + trailing `Title:`/`Author:`/`URL:` metadata lines; supports membercontaine
 their counts, plus the levels that sit directly on the page (§3.2.1) — always part of the  
 collection, no flag needed. `fetch` downloads both kinds, consulting the sitemap (§3.5) only when  
 the counters show something is on the page to recover; `fetch --resume` skips the levels already  
-in the output file and appends the rest.
+in the output file and appends the rest. A trailing slash addresses the levels on the page alone  
+(`fetch <slug>/`), which is how the collection without a name of its own is spelled.
 
 ## 7. Compliance
 

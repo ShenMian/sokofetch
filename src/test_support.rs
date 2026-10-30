@@ -214,6 +214,14 @@ pub fn wire_pack_item(fullslug: &str) -> serde_json::Value {
     })
 }
 
+/// One sub-pack entry whose `numpuzzles` counter is set explicitly, for
+/// fixtures where the counter must agree with the sub-pack's own listing.
+pub fn wire_pack_item_counted(fullslug: &str, num_puzzles: u64) -> serde_json::Value {
+    let mut item = wire_pack_item(fullslug);
+    item["numpuzzles"] = serde_json::json!(num_puzzles);
+    item
+}
+
 /// A full success envelope for one listing page.
 pub fn wire_listing(
     pack: Option<serde_json::Value>,
